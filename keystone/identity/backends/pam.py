@@ -63,13 +63,13 @@ class PamIdentity(identity.Driver):
         if auth(user_id, password):
             metadata = {}
             if user_id == 'root':
-                metadata['is_admin'] == True
+                metadata['is_admin'] = True
 
             tenant = {'id': user_id, 'name': user_id}
 
             user = {'id': user_id, 'name': user_id}
 
-            return (tenant, user, metadata)
+            return (user, tenant, metadata)
 
     def get_tenant(self, tenant_id):
         return {'id': tenant_id, 'name': tenant_id}
@@ -134,7 +134,7 @@ class PamIdentity(identity.Driver):
     def get_metadata(self, user_id, tenant_id):
         metadata = {}
         if user_id == 'root':
-            metadata['is_admin'] == True
+            metadata['is_admin'] = True
         return metadata
 
     def create_metadata(self, user_id, tenant_id, metadata):

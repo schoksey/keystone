@@ -133,6 +133,35 @@ a WSGI component. Example for the auth_token middleware::
     admin_tenant_name = service
     ;Uncomment next line and check ip:port to use memcached to cache tokens
     ;memcache_servers = 127.0.0.1:11211
+    ;Uncomment next 2 lines if Keystone server is validating client cert
+    certfile = <path to middleware public cert>
+    keyfile = <path to middleware private cert>
+
+For services which have separate paste-deploy ini file, auth_token middleware
+can be alternatively configured in [keystone_authtoken] section in the main
+config file. For example in Nova, all middleware parameters can be removed
+from api-paste.ini::
+
+    [filter:authtoken]
+    paste.filter_factory = keystone.middleware.auth_token:filter_factory
+
+and set in nova.conf::
+
+    [DEFAULT]
+    ...
+    auth_strategy=keystone
+
+    [keystone_authtoken]
+    auth_host = 127.0.0.1
+    auth_port = 35357
+    auth_protocol = http
+    auth_uri = http://127.0.0.1:5000/
+    admin_user = admin
+    admin_password = SuperSekretPassword
+    admin_tenant_name = service
+
+Note that middleware parameters in paste config take priority, they must be
+removed to use values in [keystone_authtoken] section.
 
 Configuration Options
 ---------------------
@@ -153,6 +182,9 @@ Configuration Options
 * ``auth_port``: (optional, default `35357`) the port used to validate tokens
 * ``auth_protocol``: (optional, default `https`)
 * ``auth_uri``: (optional, defaults to `auth_protocol`://`auth_host`:`auth_port`)
+* ``certfile``: (required, if Keystone server requires client cert)
+* ``keyfile``: (required, if Keystone server requires client cert)  This can be
+  the same as the certfile if the certfile includes the private key.
 
 Caching for improved response
 -----------------------------

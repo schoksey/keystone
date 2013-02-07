@@ -14,10 +14,21 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-# This file exists as a shim to get devstack testing to pass.
-# It will be removed once devstack has been updated.
-
-from keystone.policy.backends import rules
+from keystone.contrib import stats
+from keystone.common import kvs
 
 
-SimpleMatch = rules.Policy
+class Stats(kvs.Base, stats.Driver):
+    def get_stats(self, api):
+        return self.db.get('stats-%s' % api, {})
+
+    def set_stats(self, api, stats_ref):
+        self.db.set('stats-%s' % api, stats_ref)
+
+    def increment_stat(self, api, category, value):
+        """Increment a statistic counter, or create it if it doesn't exist."""
+        stats = self.get_stats(api)
+        stats.setdefault(category, dict())
+        counter = stats[category].setdefault(value, 0)
+        stats[category][value] = counter + 1
+        self.set_stats(api, stats)

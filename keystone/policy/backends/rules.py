@@ -17,13 +17,15 @@
 
 """Rules-based Policy Engine."""
 
-from keystone import config
-from keystone import exception
-from keystone import policy
+import os.path
+
 from keystone.common import logging
 from keystone.common import policy as common_policy
 from keystone.common import utils
+from keystone import config
+from keystone import exception
 from keystone.openstack.common import cfg
+from keystone import policy
 
 
 policy_opts = [
@@ -33,7 +35,7 @@ policy_opts = [
     cfg.StrOpt('policy_default_rule',
                default='default',
                help=_('Rule checked when requested rule is not found')),
-    ]
+]
 
 
 CONF = config.CONF
@@ -59,7 +61,9 @@ def init():
     global _POLICY_PATH
     global _POLICY_CACHE
     if not _POLICY_PATH:
-        _POLICY_PATH = utils.find_config(CONF.policy_file)
+        _POLICY_PATH = CONF.policy_file
+        if not os.path.exists(_POLICY_PATH):
+            _POLICY_PATH = CONF.find_file(_POLICY_PATH)
     utils.read_cached_file(_POLICY_PATH,
                            _POLICY_CACHE,
                            reload_func=_set_brain)
@@ -67,8 +71,8 @@ def init():
 
 def _set_brain(data):
     default_rule = CONF.policy_default_rule
-    common_policy.set_brain(
-            common_policy.HttpBrain.load_json(data, default_rule))
+    common_policy.set_brain(common_policy.HttpBrain.load_json(data,
+                                                              default_rule))
 
 
 def enforce(credentials, action, target):
@@ -82,7 +86,7 @@ def enforce(credentials, action, target):
                 compute:attach_volume
                 volume:attach_volume
 
-       :param object: dictionary representing the object of the action
+       :param target: dictionary representing the object of the action
                       for object creation this should be a dictionary
                       representing the location of the object e.g.
                       {'tenant_id': object.tenant_id}

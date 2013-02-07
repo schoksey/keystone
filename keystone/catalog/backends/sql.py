@@ -15,14 +15,12 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import sqlalchemy.exc
-import webob.exc
-
 from keystone import catalog
-from keystone import config
-from keystone import exception
+from keystone.catalog import core
 from keystone.common import sql
 from keystone.common.sql import migration
+from keystone import config
+from keystone import exception
 
 
 CONF = config.CONF
@@ -96,11 +94,9 @@ class Catalog(sql.Base, catalog.Driver):
 
     def delete_service(self, service_id):
         session = self.get_session()
-        service_ref = session.query(Service).filter_by(id=service_id).first()
-        if not service_ref:
-            raise exception.ServiceNotFound(service_id=service_id)
         with session.begin():
-            session.delete(service_ref)
+            if not session.query(Service).filter_by(id=service_id).delete():
+                raise exception.ServiceNotFound(service_id=service_id)
             session.flush()
 
     def create_service(self, service_id, service_ref):
@@ -114,6 +110,7 @@ class Catalog(sql.Base, catalog.Driver):
     # Endpoints
     def create_endpoint(self, endpoint_id, endpoint_ref):
         session = self.get_session()
+        self.get_service(endpoint_ref['service_id'])
         new_endpoint = Endpoint.from_dict(endpoint_ref)
         with session.begin():
             session.add(new_endpoint)
@@ -122,18 +119,17 @@ class Catalog(sql.Base, catalog.Driver):
 
     def delete_endpoint(self, endpoint_id):
         session = self.get_session()
-        endpoint_ref = session.query(Endpoint)
-        endpoint_ref = endpoint_ref.filter_by(id=endpoint_id).first()
-        if not endpoint_ref:
-            raise exception.EndpointNotFound(endpoint_id=endpoint_id)
         with session.begin():
-            session.delete(endpoint_ref)
+            if not session.query(Endpoint).filter_by(id=endpoint_id).delete():
+                raise exception.EndpointNotFound(endpoint_id=endpoint_id)
             session.flush()
 
     def get_endpoint(self, endpoint_id):
         session = self.get_session()
         endpoint_ref = session.query(Endpoint)
         endpoint_ref = endpoint_ref.filter_by(id=endpoint_id).first()
+        if not endpoint_ref:
+            raise exception.EndpointNotFound(endpoint_id=endpoint_id)
         return endpoint_ref.to_dict()
 
     def list_endpoints(self):
@@ -160,12 +156,11 @@ class Catalog(sql.Base, catalog.Driver):
 
             catalog[region][srv_type] = {}
 
-            internal_url = ep['internalurl'].replace('$(', '%(')
-            public_url = ep['publicurl'].replace('$(', '%(')
-            admin_url = ep['adminurl'].replace('$(', '%(')
-            catalog[region][srv_type]['name'] = srv_name
-            catalog[region][srv_type]['publicURL'] = public_url % d
-            catalog[region][srv_type]['adminURL'] = admin_url % d
-            catalog[region][srv_type]['internalURL'] = internal_url % d
+            srv_type = catalog[region][srv_type]
+            srv_type['id'] = ep['id']
+            srv_type['name'] = srv_name
+            srv_type['publicURL'] = core.format_url(ep.get('publicurl', ''), d)
+            srv_type['internalURL'] = core.format_url(ep.get('internalurl'), d)
+            srv_type['adminURL'] = core.format_url(ep.get('adminurl'), d)
 
         return catalog

@@ -55,10 +55,8 @@ To run a single test module:
     python run_tests.py api.test_wsgi
 
 """
-
-import gettext
+import eventlet
 import heapq
-import logging
 import os
 import unittest
 import sys
@@ -139,7 +137,7 @@ class _Win32Colorizer(object):
             'magenta': red | blue | bold,
             'cyan': green | blue | bold,
             'white': red | green | blue | bold
-            }
+        }
 
     def supported(cls, stream=sys.stdout):
         try:
@@ -337,6 +335,7 @@ if __name__ == '__main__':
     # If any argument looks like a test name but doesn't have "nova.tests" in
     # front of it, automatically add that so we don't have to type as much
     show_elapsed = True
+    do_monkeypatch = True
     argv = []
     for x in sys.argv:
         if x.startswith('test_'):
@@ -345,9 +344,12 @@ if __name__ == '__main__':
             argv.append(x)
         elif x.startswith('--hide-elapsed'):
             show_elapsed = False
+        elif x.startswith('--no-monkeypatch'):
+            do_monkeypatch = False
         else:
             argv.append(x)
-
+    eventlet.patcher.monkey_patch(all=False, socket=True, time=True,
+                                  thread=do_monkeypatch)
     testdir = os.path.abspath(os.path.join("tests"))
     c = config.Config(stream=sys.stdout,
                       env=os.environ,
@@ -359,4 +361,7 @@ if __name__ == '__main__':
                             verbosity=c.verbosity,
                             config=c,
                             show_elapsed=show_elapsed)
+    if os.path.exists('tests/test.db.pristine'):
+        os.unlink('tests/test.db.pristine')
+
     sys.exit(not core.run(config=c, testRunner=runner, argv=argv))

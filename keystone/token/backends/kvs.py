@@ -15,20 +15,23 @@
 # under the License.
 
 import copy
-import datetime
 
 from keystone.common import kvs
 from keystone import exception
+from keystone.openstack.common import timeutils
 from keystone import token
 
 
 class Token(kvs.Base, token.Driver):
+
     # Public interface
     def get_token(self, token_id):
-        token = self.db.get('token-%s' % token_id)
-        if (token and (token['expires'] is None
-                       or token['expires'] > datetime.datetime.utcnow())):
-            return token
+        try:
+            token = self.db.get('token-%s' % token_id)
+        except exception.NotFound:
+            raise exception.TokenNotFound(token_id=token_id)
+        if token['expires'] is None or token['expires'] > timeutils.utcnow():
+            return copy.deepcopy(token)
         else:
             raise exception.TokenNotFound(token_id=token_id)
 
@@ -41,6 +44,41 @@ class Token(kvs.Base, token.Driver):
 
     def delete_token(self, token_id):
         try:
-            return self.db.delete('token-%s' % token_id)
-        except KeyError:
+            token_ref = self.get_token(token_id)
+            self.db.delete('token-%s' % token_id)
+            self.db.set('revoked-token-%s' % token_id, token_ref)
+        except exception.NotFound:
             raise exception.TokenNotFound(token_id=token_id)
+
+    def list_tokens(self, user_id, tenant_id=None):
+        tokens = []
+        now = timeutils.utcnow()
+        for token, ref in self.db.items():
+            if not token.startswith('token-'):
+                continue
+            user = ref.get('user')
+            if not user:
+                continue
+            if user.get('id') != user_id:
+                continue
+            if ref.get('expires') and ref.get('expires') < now:
+                continue
+            if tenant_id is not None:
+                tenant = ref.get('tenant')
+                if not tenant:
+                    continue
+                if tenant.get('id') != tenant_id:
+                    continue
+            tokens.append(token.split('-', 1)[1])
+        return tokens
+
+    def list_revoked_tokens(self):
+        tokens = []
+        for token, token_ref in self.db.items():
+            if not token.startswith('revoked-token-'):
+                continue
+            record = {}
+            record['id'] = token_ref['id']
+            record['expires'] = token_ref['expires']
+            tokens.append(record)
+        return tokens

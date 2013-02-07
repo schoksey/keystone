@@ -20,21 +20,18 @@
 
 """Utility methods for working with WSGI servers."""
 
-import json
 import sys
 
-import eventlet
 import eventlet.wsgi
-eventlet.patcher.monkey_patch(all=False, socket=True, time=True)
-import routes
 import routes.middleware
-import webob
+import ssl
 import webob.dec
 import webob.exc
 
-from keystone import exception
 from keystone.common import logging
 from keystone.common import utils
+from keystone import exception
+from keystone.openstack.common import jsonutils
 
 
 LOG = logging.getLogger(__name__)
@@ -61,17 +58,40 @@ class Server(object):
         self.pool = eventlet.GreenPool(threads)
         self.socket_info = {}
         self.greenthread = None
+        self.do_ssl = False
+        self.cert_required = False
 
     def start(self, key=None, backlog=128):
         """Run a WSGI server with the given application."""
         LOG.debug('Starting %(arg0)s on %(host)s:%(port)s' %
-                      {'arg0': sys.argv[0],
-                       'host': self.host,
-                       'port': self.port})
+                  {'arg0': sys.argv[0],
+                   'host': self.host,
+                   'port': self.port})
         socket = eventlet.listen((self.host, self.port), backlog=backlog)
-        self.greenthread = self.pool.spawn(self._run, self.application, socket)
         if key:
             self.socket_info[key] = socket.getsockname()
+        # SSL is enabled
+        if self.do_ssl:
+            if self.cert_required:
+                cert_reqs = ssl.CERT_REQUIRED
+            else:
+                cert_reqs = ssl.CERT_NONE
+            sslsocket = eventlet.wrap_ssl(socket, certfile=self.certfile,
+                                          keyfile=self.keyfile,
+                                          server_side=True,
+                                          cert_reqs=cert_reqs,
+                                          ca_certs=self.ca_certs)
+            socket = sslsocket
+
+        self.greenthread = self.pool.spawn(self._run, self.application, socket)
+
+    def set_ssl(self, certfile, keyfile=None, ca_certs=None,
+                cert_required=True):
+        self.certfile = certfile
+        self.keyfile = keyfile
+        self.ca_certs = ca_certs
+        self.cert_required = cert_required
+        self.do_ssl = True
 
     def kill(self):
         if self.greenthread:
@@ -182,6 +202,10 @@ class Application(BaseApplication):
 
         try:
             result = method(context, **params)
+        except exception.Unauthorized as e:
+            LOG.warning("Authorization failed. %s from %s"
+                        % (e, req.environ['REMOTE_ADDR']))
+            return render_exception(e)
         except exception.Error as e:
             LOG.warning(e)
             return render_exception(e)
@@ -210,7 +234,7 @@ class Application(BaseApplication):
         if not context['is_admin']:
             try:
                 user_token_ref = self.token_api.get_token(
-                        context=context, token_id=context['token_id'])
+                    context=context, token_id=context['token_id'])
             except exception.TokenNotFound:
                 raise exception.Unauthorized()
 
@@ -335,11 +359,8 @@ class Debug(Middleware):
         """Iterator that prints the contents of a wrapper string."""
         LOG.debug('%s %s %s', ('*' * 20), 'RESPONSE BODY', ('*' * 20))
         for part in app_iter:
-            #sys.stdout.write(part)
             LOG.debug(part)
-            #sys.stdout.flush()
             yield part
-        print
 
 
 class Router(object):
@@ -394,7 +415,8 @@ class Router(object):
         """
         match = req.environ['wsgiorg.routing_args'][1]
         if not match:
-            return webob.exc.HTTPNotFound()
+            return render_exception(
+                exception.NotFound('The resource could not be found.'))
         app = match['controller']
         return app
 
@@ -470,17 +492,22 @@ class ExtensionRouter(Router):
         return _factory
 
 
-def render_response(body=None, status=(200, 'OK'), headers=None):
+def render_response(body=None, status=None, headers=None):
     """Forms a WSGI response."""
-    resp = webob.Response()
-    resp.status = '%s %s' % status
-    resp.headerlist = headers or [('Content-Type', 'application/json'),
-                                  ('Vary', 'X-Auth-Token')]
+    headers = headers or []
+    headers.append(('Vary', 'X-Auth-Token'))
 
-    if body is not None:
-        resp.body = json.dumps(body, cls=utils.SmarterEncoder)
+    if body is None:
+        body = ''
+        status = status or (204, 'No Content')
+    else:
+        body = jsonutils.dumps(body, cls=utils.SmarterEncoder)
+        headers.append(('Content-Type', 'application/json'))
+        status = status or (200, 'OK')
 
-    return resp
+    return webob.Response(body=body,
+                          status='%s %s' % status,
+                          headerlist=headers)
 
 
 def render_exception(error):

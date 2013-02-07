@@ -17,11 +17,12 @@
 import copy
 import functools
 
-from keystone import identity
-from keystone import exception
+from keystone import clean
 from keystone.common import sql
-from keystone.common import utils
 from keystone.common.sql import migration
+from keystone.common import utils
+from keystone import exception
+from keystone import identity
 
 
 def _filter_user(user_ref):
@@ -45,7 +46,7 @@ def handle_conflicts(type='object'):
             try:
                 return method(*args, **kwargs)
             except sql.IntegrityError as e:
-                raise exception.Conflict(type=type, details=str(e))
+                raise exception.Conflict(type=type, details=e.message)
         return wrapper
     return decorator
 
@@ -53,7 +54,7 @@ def handle_conflicts(type='object'):
 class User(sql.ModelBase, sql.DictBase):
     __tablename__ = 'user'
     id = sql.Column(sql.String(64), primary_key=True)
-    name = sql.Column(sql.String(64), unique=True)
+    name = sql.Column(sql.String(64), unique=True, nullable=False)
     #password = sql.Column(sql.String(64))
     extra = sql.Column(sql.JsonBlob())
 
@@ -79,7 +80,7 @@ class User(sql.ModelBase, sql.DictBase):
 class Tenant(sql.ModelBase, sql.DictBase):
     __tablename__ = 'tenant'
     id = sql.Column(sql.String(64), primary_key=True)
-    name = sql.Column(sql.String(64), unique=True)
+    name = sql.Column(sql.String(64), unique=True, nullable=False)
     extra = sql.Column(sql.JsonBlob())
 
     @classmethod
@@ -104,7 +105,7 @@ class Tenant(sql.ModelBase, sql.DictBase):
 class Role(sql.ModelBase, sql.DictBase):
     __tablename__ = 'role'
     id = sql.Column(sql.String(64), primary_key=True)
-    name = sql.Column(sql.String(64), unique=True)
+    name = sql.Column(sql.String(64), unique=True, nullable=False)
 
 
 class Metadata(sql.ModelBase, sql.DictBase):
@@ -134,6 +135,20 @@ class Identity(sql.Base, identity.Driver):
     def db_sync(self):
         migration.db_sync()
 
+    def _check_password(self, password, user_ref):
+        """Check the specified password against the data store.
+
+        This is modeled on ldap/core.py.  The idea is to make it easier to
+        subclass Identity so that you can still use it to store all the data,
+        but use some other means to check the password.
+        Note that we'll pass in the entire user_ref in case the subclass
+        needs things like user_ref.get('name')
+        For further justification, please see the follow up suggestion at
+        https://blueprints.launchpad.net/keystone/+spec/sql-identiy-pam
+
+        """
+        return utils.check_password(password, user_ref.get('password'))
+
     # Identity interface
     def authenticate(self, user_id=None, tenant_id=None, password=None):
         """Authenticate based on a user, tenant and password.
@@ -142,56 +157,69 @@ class Identity(sql.Base, identity.Driver):
         in the list of tenants on the user.
 
         """
-        user_ref = self._get_user(user_id)
-        if (not user_ref
-            or not utils.check_password(password, user_ref.get('password'))):
+        user_ref = None
+        tenant_ref = None
+        metadata_ref = {}
+
+        try:
+            user_ref = self._get_user(user_id)
+        except exception.UserNotFound:
             raise AssertionError('Invalid user / password')
 
-        tenants = self.get_tenants_for_user(user_id)
-        if tenant_id and tenant_id not in tenants:
-            raise AssertionError('Invalid tenant')
+        if not self._check_password(password, user_ref):
+            raise AssertionError('Invalid user / password')
 
-        tenant_ref = self.get_tenant(tenant_id)
-        if tenant_ref:
-            metadata_ref = self.get_metadata(user_id, tenant_id)
-        else:
-            metadata_ref = {}
+        if tenant_id is not None:
+            if tenant_id not in self.get_tenants_for_user(user_id):
+                raise AssertionError('Invalid tenant')
+
+            try:
+                tenant_ref = self.get_tenant(tenant_id)
+                metadata_ref = self.get_metadata(user_id, tenant_id)
+            except exception.TenantNotFound:
+                tenant_ref = None
+                metadata_ref = {}
+            except exception.MetadataNotFound:
+                metadata_ref = {}
+
         return (_filter_user(user_ref), tenant_ref, metadata_ref)
 
     def get_tenant(self, tenant_id):
         session = self.get_session()
         tenant_ref = session.query(Tenant).filter_by(id=tenant_id).first()
-        if not tenant_ref:
-            return
+        if tenant_ref is None:
+            raise exception.TenantNotFound(tenant_id=tenant_id)
         return tenant_ref.to_dict()
 
     def get_tenant_by_name(self, tenant_name):
         session = self.get_session()
         tenant_ref = session.query(Tenant).filter_by(name=tenant_name).first()
         if not tenant_ref:
-            return
+            raise exception.TenantNotFound(tenant_id=tenant_name)
         return tenant_ref.to_dict()
 
     def get_tenant_users(self, tenant_id):
         session = self.get_session()
+        self.get_tenant(tenant_id)
         user_refs = session.query(User)\
-                .join(UserTenantMembership)\
-                .filter(UserTenantMembership.tenant_id == tenant_id)\
-                .all()
+            .join(UserTenantMembership)\
+            .filter(UserTenantMembership.tenant_id ==
+                    tenant_id)\
+            .all()
         return [_filter_user(user_ref.to_dict()) for user_ref in user_refs]
 
     def _get_user(self, user_id):
         session = self.get_session()
         user_ref = session.query(User).filter_by(id=user_id).first()
         if not user_ref:
-            return
+            raise exception.UserNotFound(user_id=user_id)
         return user_ref.to_dict()
 
     def _get_user_by_name(self, user_name):
         session = self.get_session()
         user_ref = session.query(User).filter_by(name=user_name).first()
         if not user_ref:
-            return
+            raise exception.UserNotFound(user_id=user_name)
         return user_ref.to_dict()
 
     def get_user(self, user_id):
@@ -206,11 +234,16 @@ class Identity(sql.Base, identity.Driver):
                               .filter_by(user_id=user_id)\
                               .filter_by(tenant_id=tenant_id)\
                               .first()
-        return getattr(metadata_ref, 'data', {})
+        if metadata_ref is None:
+            raise exception.MetadataNotFound()
+        return metadata_ref.data
 
     def get_role(self, role_id):
         session = self.get_session()
-        return session.query(Role).filter_by(id=role_id).first()
+        role_ref = session.query(Role).filter_by(id=role_id).first()
+        if role_ref is None:
+            raise exception.RoleNotFound(role_id=role_id)
+        return role_ref
 
     def list_users(self):
         session = self.get_session()
@@ -225,6 +258,8 @@ class Identity(sql.Base, identity.Driver):
     # These should probably be part of the high-level API
     def add_user_to_tenant(self, tenant_id, user_id):
         session = self.get_session()
+        self.get_tenant(tenant_id)
+        self.get_user(user_id)
         q = session.query(UserTenantMembership)\
                    .filter_by(user_id=user_id)\
                    .filter_by(tenant_id=tenant_id)
@@ -239,10 +274,14 @@ class Identity(sql.Base, identity.Driver):
 
     def remove_user_from_tenant(self, tenant_id, user_id):
         session = self.get_session()
+        self.get_tenant(tenant_id)
+        self.get_user(user_id)
         membership_ref = session.query(UserTenantMembership)\
                                 .filter_by(user_id=user_id)\
                                 .filter_by(tenant_id=tenant_id)\
                                 .first()
+        if membership_ref is None:
+            raise exception.NotFound('User not found in tenant')
         with session.begin():
             session.delete(membership_ref)
             session.flush()
@@ -254,37 +293,50 @@ class Identity(sql.Base, identity.Driver):
 
     def get_tenants_for_user(self, user_id):
         session = self.get_session()
+        self.get_user(user_id)
         membership_refs = session.query(UserTenantMembership)\
-                          .filter_by(user_id=user_id)\
-                          .all()
+                                 .filter_by(user_id=user_id)\
+                                 .all()
         return [x.tenant_id for x in membership_refs]
 
     def get_roles_for_user_and_tenant(self, user_id, tenant_id):
-        metadata_ref = self.get_metadata(user_id, tenant_id)
-        if not metadata_ref:
+        self.get_user(user_id)
+        self.get_tenant(tenant_id)
+        try:
+            metadata_ref = self.get_metadata(user_id, tenant_id)
+        except exception.MetadataNotFound:
             metadata_ref = {}
         return metadata_ref.get('roles', [])
 
     def add_role_to_user_and_tenant(self, user_id, tenant_id, role_id):
-        metadata_ref = self.get_metadata(user_id, tenant_id)
-        is_new = False
-        if not metadata_ref:
-            is_new = True
+        self.get_user(user_id)
+        self.get_tenant(tenant_id)
+        self.get_role(role_id)
+        try:
+            metadata_ref = self.get_metadata(user_id, tenant_id)
+            is_new = False
+        except exception.MetadataNotFound:
             metadata_ref = {}
+            is_new = True
         roles = set(metadata_ref.get('roles', []))
+        if role_id in roles:
+            msg = ('User %s already has role %s in tenant %s'
+                   % (user_id, role_id, tenant_id))
+            raise exception.Conflict(type='role grant', details=msg)
         roles.add(role_id)
         metadata_ref['roles'] = list(roles)
-        if not is_new:
-            self.update_metadata(user_id, tenant_id, metadata_ref)
-        else:
+        if is_new:
             self.create_metadata(user_id, tenant_id, metadata_ref)
+        else:
+            self.update_metadata(user_id, tenant_id, metadata_ref)
 
     def remove_role_from_user_and_tenant(self, user_id, tenant_id, role_id):
-        metadata_ref = self.get_metadata(user_id, tenant_id)
-        is_new = False
-        if not metadata_ref:
-            is_new = True
+        try:
+            metadata_ref = self.get_metadata(user_id, tenant_id)
+            is_new = False
+        except exception.MetadataNotFound:
             metadata_ref = {}
+            is_new = True
         roles = set(metadata_ref.get('roles', []))
         if role_id not in roles:
             msg = 'Cannot remove role that has not been granted, %s' % role_id
@@ -292,14 +344,15 @@ class Identity(sql.Base, identity.Driver):
 
         roles.remove(role_id)
         metadata_ref['roles'] = list(roles)
-        if not is_new:
-            self.update_metadata(user_id, tenant_id, metadata_ref)
-        else:
+        if is_new:
             self.create_metadata(user_id, tenant_id, metadata_ref)
+        else:
+            self.update_metadata(user_id, tenant_id, metadata_ref)
 
     # CRUD
     @handle_conflicts(type='user')
     def create_user(self, user_id, user):
+        user['name'] = clean.user_name(user['name'])
         user = _ensure_hashed_password(user)
         session = self.get_session()
         with session.begin():
@@ -310,9 +363,15 @@ class Identity(sql.Base, identity.Driver):
 
     @handle_conflicts(type='user')
     def update_user(self, user_id, user):
+        if 'name' in user:
+            user['name'] = clean.user_name(user['name'])
         session = self.get_session()
+        if 'id' in user and user_id != user['id']:
+            raise exception.ValidationError('Cannot change user ID')
         with session.begin():
             user_ref = session.query(User).filter_by(id=user_id).first()
+            if user_ref is None:
+                raise exception.UserNotFound(user_id=user_id)
             old_user_dict = user_ref.to_dict()
             user = _ensure_hashed_password(user)
             for k in user:
@@ -326,21 +385,17 @@ class Identity(sql.Base, identity.Driver):
 
     def delete_user(self, user_id):
         session = self.get_session()
-        user_ref = session.query(User).filter_by(id=user_id).first()
-        membership_refs = session.query(UserTenantMembership)\
-                          .filter_by(user_id=user_id)\
-                          .all()
-
         with session.begin():
-            if membership_refs:
-                for membership_ref in membership_refs:
-                    session.delete(membership_ref)
-
-            session.delete(user_ref)
-            session.flush()
+            session.query(UserTenantMembership)\
+                   .filter_by(user_id=user_id).delete(False)
+            session.query(Metadata)\
+                   .filter_by(user_id=user_id).delete(False)
+            if not session.query(User).filter_by(id=user_id).delete(False):
+                raise exception.UserNotFound(user_id=user_id)
 
     @handle_conflicts(type='tenant')
     def create_tenant(self, tenant_id, tenant):
+        tenant['name'] = clean.tenant_name(tenant['name'])
         session = self.get_session()
         with session.begin():
             tenant_ref = Tenant.from_dict(tenant)
@@ -350,9 +405,13 @@ class Identity(sql.Base, identity.Driver):
 
     @handle_conflicts(type='tenant')
     def update_tenant(self, tenant_id, tenant):
+        if 'name' in tenant:
+            tenant['name'] = clean.tenant_name(tenant['name'])
         session = self.get_session()
         with session.begin():
             tenant_ref = session.query(Tenant).filter_by(id=tenant_id).first()
+            if tenant_ref is None:
+                raise exception.TenantNotFound(tenant_id=tenant_id)
             old_tenant_dict = tenant_ref.to_dict()
             for k in tenant:
                 old_tenant_dict[k] = tenant[k]
@@ -365,10 +424,13 @@ class Identity(sql.Base, identity.Driver):
 
     def delete_tenant(self, tenant_id):
         session = self.get_session()
-        tenant_ref = session.query(Tenant).filter_by(id=tenant_id).first()
         with session.begin():
-            session.delete(tenant_ref)
-            session.flush()
+            session.query(UserTenantMembership)\
+                   .filter_by(tenant_id=tenant_id).delete(False)
+            session.query(Metadata)\
+                   .filter_by(tenant_id=tenant_id).delete(False)
+            if not session.query(Tenant).filter_by(id=tenant_id).delete(False):
+                raise exception.TenantNotFound(tenant_id=tenant_id)
 
     @handle_conflicts(type='metadata')
     def create_metadata(self, user_id, tenant_id, metadata):
@@ -412,6 +474,8 @@ class Identity(sql.Base, identity.Driver):
         session = self.get_session()
         with session.begin():
             role_ref = session.query(Role).filter_by(id=role_id).first()
+            if role_ref is None:
+                raise exception.RoleNotFound(role_id=role_id)
             for k in role:
                 role_ref[k] = role[k]
             session.flush()
@@ -419,6 +483,7 @@ class Identity(sql.Base, identity.Driver):
 
     def delete_role(self, role_id):
         session = self.get_session()
-        role_ref = session.query(Role).filter_by(id=role_id).first()
         with session.begin():
-            session.delete(role_ref)
+            if not session.query(Role).filter_by(id=role_id).delete():
+                raise exception.RoleNotFound(role_id=role_id)
+            session.flush()

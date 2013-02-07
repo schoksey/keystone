@@ -13,11 +13,12 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+
 import uuid
-import json
 
 from keystone.common import wsgi
 from keystone import exception
+from keystone.openstack.common import jsonutils
 from keystone import test
 
 
@@ -33,7 +34,7 @@ class ExceptionTestCase(test.TestCase):
         self.assertEqual(resp.status_int, e.code)
         self.assertEqual(resp.status, '%s %s' % (e.code, e.title))
 
-        j = json.loads(resp.body)
+        j = jsonutils.loads(resp.body)
         self.assertIsNotNone(j.get('error'))
         self.assertIsNotNone(j['error'].get('code'))
         self.assertIsNotNone(j['error'].get('title'))
@@ -42,6 +43,20 @@ class ExceptionTestCase(test.TestCase):
         self.assertNotIn('  ', j['error']['message'])
         self.assertTrue(type(j['error']['code']) is int)
 
+    def test_all_json_renderings(self):
+        """Everything callable in the exception module should be renderable.
+
+        ... except for the base error class (exception.Error), which is not
+        user-facing.
+
+        This test provides a custom message to bypass docstring parsing, which
+        should be tested seperately.
+
+        """
+        for cls in [x for x in exception.__dict__.values() if callable(x)]:
+            if cls is not exception.Error:
+                self.assertValidJsonRendering(cls(message='Overriden.'))
+
     def test_validation_error(self):
         target = uuid.uuid4().hex
         attribute = uuid.uuid4().hex
@@ -49,10 +64,6 @@ class ExceptionTestCase(test.TestCase):
         self.assertValidJsonRendering(e)
         self.assertIn(target, str(e))
         self.assertIn(attribute, str(e))
-
-    def test_unauthorized(self):
-        e = exception.Unauthorized()
-        self.assertValidJsonRendering(e)
 
     def test_forbidden_action(self):
         action = uuid.uuid4().hex

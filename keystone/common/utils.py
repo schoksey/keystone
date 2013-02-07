@@ -24,14 +24,13 @@ import hmac
 import json
 import os
 import subprocess
-import sys
 import time
 import urllib
 
 import passlib.hash
 
-from keystone import config
 from keystone.common import logging
+from keystone import config
 
 
 CONF = config.CONF
@@ -39,51 +38,7 @@ config.register_int('crypt_strength', default=40000)
 
 LOG = logging.getLogger(__name__)
 
-ISO_TIME_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 MAX_PASSWORD_LENGTH = 4096
-
-
-def import_class(import_str):
-    """Returns a class from a string including module and class."""
-    mod_str, _sep, class_str = import_str.rpartition('.')
-    try:
-        __import__(mod_str)
-        return getattr(sys.modules[mod_str], class_str)
-    except (ImportError, ValueError, AttributeError), exc:
-        LOG.debug('Inner Exception: %s', exc)
-        raise
-
-
-def import_object(import_str, *args, **kw):
-    """Returns an object including a module or module and class."""
-    try:
-        __import__(import_str)
-        return sys.modules[import_str]
-    except ImportError:
-        cls = import_class(import_str)
-        return cls(*args, **kw)
-
-
-def find_config(config_path):
-    """Find a configuration file using the given hint.
-
-    :param config_path: Full or relative path to the config.
-    :returns: Full path of the config, if it exists.
-
-    """
-    possible_locations = [
-        config_path,
-        os.path.join('etc', 'keystone', config_path),
-        os.path.join('etc', config_path),
-        os.path.join(config_path),
-        '/etc/keystone/%s' % config_path,
-    ]
-
-    for path in possible_locations:
-        if os.path.exists(path):
-            return os.path.abspath(path)
-
-    raise Exception('Config not found: %s', os.path.abspath(config_path))
 
 
 def read_cached_file(filename, cache_info, reload_func=None):
@@ -220,7 +175,6 @@ def ldap_check_password(password, hashed):
     if password is None:
         return False
     password_utf8 = trunc_password(password).encode('utf-8')
-    h = passlib.hash.ldap_salted_sha1.encrypt(password_utf8)
     return passlib.hash.ldap_salted_sha1.verify(password_utf8, hashed)
 
 
@@ -276,16 +230,6 @@ def git(*args):
     return check_output(['git'] + list(args))
 
 
-def isotime(dt_obj):
-    """Format datetime object as ISO compliant string.
-
-    :param dt_obj: datetime.datetime object
-    :returns: string representation of datetime object
-
-    """
-    return dt_obj.strftime(ISO_TIME_FORMAT)
-
-
 def unixtime(dt_obj):
     """Format datetime object as unix timestamp
 
@@ -318,3 +262,9 @@ def auth_str_equal(provided, known):
         b = ord(known[i]) if i < k_len else 0
         result |= a ^ b
     return (p_len == k_len) & (result == 0)
+
+
+def hash_signed_token(signed_text):
+    hash_ = hashlib.md5()
+    hash_.update(signed_text)
+    return hash_.hexdigest()

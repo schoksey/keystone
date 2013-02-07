@@ -15,14 +15,14 @@
 # under the License.
 
 import subprocess
-import nose.exc
 
 from keystone import config
-from keystone import test
 from keystone.identity.backends import ldap as identity_ldap
+from keystone import test
 
 import default_fixtures
 import test_backend
+import test_backend_ldap
 
 
 CONF = config.CONF
@@ -41,10 +41,9 @@ def delete_object(name):
 
 
 def clear_live_database():
-    roles = ['keystone_admin']
+    roles = ['keystone_admin', 'fake1', 'fake2', 'useless']
     groups = ['baz', 'bar', 'tenent4add', 'fake1', 'fake2']
-    users = ['foo', 'two', 'fake1', 'fake2']
-    roles = ['keystone_admin', 'useless']
+    users = ['foo', 'two', 'fake1', 'fake2', 'no_meta']
 
     for group in groups:
         for role in roles:
@@ -58,12 +57,12 @@ def clear_live_database():
         delete_object('cn=%s,ou=Roles' % role)
 
 
-class LDAPIdentity(test.TestCase, test_backend.IdentityTests):
+class LiveLDAPIdentity(test_backend_ldap.LDAPIdentity):
     def setUp(self):
-        super(LDAPIdentity, self).setUp()
-        CONF(config_files=[test.etcdir('keystone.conf.sample'),
-                           test.testsdir('test_overrides.conf'),
-                           test.testsdir('backend_liveldap.conf')])
+        super(LiveLDAPIdentity, self).setUp()
+        self.config([test.etcdir('keystone.conf.sample'),
+                     test.testsdir('test_overrides.conf'),
+                     test.testsdir('backend_liveldap.conf')])
         clear_live_database()
         self.identity_api = identity_ldap.Identity()
         self.load_fixtures(default_fixtures)

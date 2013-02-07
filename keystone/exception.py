@@ -77,6 +77,12 @@ class EndpointNotFound(NotFound):
     """Could not find endpoint: %(endpoint_id)s"""
 
 
+class MetadataNotFound(NotFound):
+    """An unhandled exception has occurred: Could not find metadata."""
+    # (dolph): metadata is not a user-facing concept,
+    #          so this exception should not be exposed
+
+
 class RoleNotFound(NotFound):
     """Could not find role: %(role_id)s"""
 
@@ -107,12 +113,6 @@ class Conflict(Error):
     title = 'Conflict'
 
 
-class NotImplemented(Error):
-    """The action you have requested has not been implemented."""
-    code = 501
-    action = 'Not Implemented'
-
-
 class UnexpectedError(Error):
     """An unexpected error prevented the server from fulfilling your request.
 
@@ -121,3 +121,13 @@ class UnexpectedError(Error):
     """
     code = 500
     title = 'Internal Server Error'
+
+
+class MalformedEndpoint(UnexpectedError):
+    """Malformed endpoint URL (see ERROR log for details): %(endpoint)s"""
+
+
+class NotImplemented(Error):
+    """The action you have requested has not been implemented."""
+    code = 501
+    title = 'Not Implemented'

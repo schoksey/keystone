@@ -45,6 +45,18 @@ Stop the process using ``Control-C``.
 
     If you have not already configured Keystone, it may not start as expected.
 
+Memcached and System Time
+=========================
+
+If using `memcached`_ with Keystone - e.g. using the memcache token
+driver or the ``auth_token`` middleware - ensure that the system time
+of memcached hosts is set to UTC.  Memcached uses the host's system
+time in determining whether a key has expired, whereas Keystone sets
+key expiry in UTC.  The timezone used by Keystone and memcached must
+match if key expiry is to behave as expected.
+
+.. _`memcached`: http://memcached.org/
+
 Configuration Files
 ===================
 
@@ -56,10 +68,12 @@ values are organized into the following sections:
 * ``[DEFAULT]`` - general configuration
 * ``[sql]`` - optional storage backend configuration
 * ``[ec2]`` - Amazon EC2 authentication driver configuration
+* ``[s3]`` - Amazon S3 authentication driver configuration.
 * ``[identity]`` - identity system driver configuration
 * ``[catalog]`` - service catalog driver configuration
 * ``[token]`` - token driver configuration
 * ``[policy]`` - policy system driver configuration for RBAC
+* ``[ssl]`` - SSL configuration
 
 The Keystone configuration file is expected to be named ``keystone.conf``.
 When starting keystone, you can specify a different configuration file to
@@ -148,6 +162,115 @@ choosing the output levels and formats.
 
 .. _Paste: http://pythonpaste.org/
 .. _`python logging module`: http://docs.python.org/library/logging.html
+
+Monitoring
+----------
+
+Keystone provides some basic request/response monitoring statistics out of the
+box.
+
+Enable data collection by defining a ``stats_monitoring`` filter and including
+it at the beginning of any desired WSGI pipelines::
+
+    [filter:stats_monitoring]
+    paste.filter_factory = keystone.contrib.stats:StatsMiddleware.factory
+
+    [pipeline:public_api]
+    pipeline = stats_monitoring [...] public_service
+
+Enable the reporting of collected data by defining a ``stats_reporting`` filter
+and including it near the end of your ``admin_api`` WSGI pipeline (After
+``*_body`` middleware and before ``*_extension`` filters is recommended)::
+
+    [filter:stats_reporting]
+    paste.filter_factory = keystone.contrib.stats:StatsExtension.factory
+
+    [pipeline:admin_api]
+    pipeline = [...] json_body stats_reporting ec2_extension [...] admin_service
+
+Query the admin API for statistics using::
+
+    $ curl -H 'X-Auth-Token: ADMIN' http://localhost:35357/v2.0/OS-STATS/stats
+
+Reset collected data using::
+
+    $ curl -H 'X-Auth-Token: ADMIN' -X DELETE http://localhost:35357/v2.0/OS-STATS/stats
+
+SSL
+---
+
+Keystone may be configured to support 2-way SSL out-of-the-box.  The x509
+certificates used by Keystone must be obtained externally and configured for use
+with Keystone as described in this section.  However, a set of sample certficates
+is provided in the examples/ssl directory with the Keystone distribution for testing.
+Here is the description of each of them and their purpose:
+
+Types of certificates
+^^^^^^^^^^^^^^^^^^^^^
+
+ca.pem
+    Certificate Authority chain to validate against.
+
+keystone.pem
+    Public certificate for Keystone server.
+
+middleware.pem
+    Public and private certificate for Keystone middleware/client.
+
+cakey.pem
+    Private key for the CA.
+
+keystonekey.pem
+    Private key for the Keystone server.
+
+Note that you may choose whatever names you want for these certificates, or combine
+the public/private keys in the same file if you wish.  These certificates are just
+provided as an example.
+
+Configuration
+^^^^^^^^^^^^^
+
+To enable SSL with client authentication, modify the etc/keystone.conf file accordingly
+under the [ssl] section.  SSL configuration example using the included sample
+certificates::
+
+    [ssl]
+    enable = True
+    certfile = <path to keystone.pem>
+    keyfile = <path to keystonekey.pem>
+    ca_certs = <path to ca.pem>
+    cert_required = True
+
+* ``enable``:  True enables SSL.  Defaults to False.
+* ``certfile``:  Path to Keystone public certificate file.
+* ``keyfile``:  Path to Keystone private certificate file.  If the private key is included in the certfile, the keyfile maybe omitted.
+* ``ca_certs``:  Path to CA trust chain.
+* ``cert_required``:  Requires client certificate.  Defaults to False.
+
+User CRUD
+---------
+
+Keystone provides a user CRUD filter that can be added to the public_api
+pipeline. This user crud filter allows users to use a HTTP PATCH to change
+their own password. To enable this extension you should define a
+user_crud_extension filter, insert it after the ``*_body`` middleware
+and before the ``public_service`` app in the public_api WSGI pipeline in
+keystone.conf e.g.::
+
+    [filter:user_crud_extension]
+    paste.filter_factory = keystone.contrib.user_crud:CrudExtension.factory
+
+    [pipeline:public_api]
+    pipeline = stats_monitoring url_normalize token_auth admin_token_auth xml_body json_body debug ec2_extension user_crud_extension public_service
+
+Each user can then change their own password with a HTTP PATCH ::
+
+    > curl -X PATCH http://localhost:5000/v2.0/OS-KSCRUD/users/<userid> -H "Content-type: application/json"  \
+    -H "X_Auth_Token: <authtokenid>" -d '{"user": {"password": "ABCD", "original_password": "DCBA"}}'
+
+In addition to changing their password all of the users current tokens will be
+deleted (if the backend used is kvs or sql)
+
 
 Sample Configuration Files
 --------------------------
@@ -465,7 +588,7 @@ keyword arguments
 * name
 * pass
 * email
-* default_tenant (optional, defaults to None)
+* tenant_id (optional, defaults to None)
 * enabled (optional, defaults to True)
 
 example::
@@ -473,6 +596,7 @@ example::
     $ keystone user-create
     --name=admin \
     --pass=secrete \
+    --tenant_id=2395953419144b67955ac4bab96b8fd2 \
     --email=admin@example.com
 
 ``user-delete``
@@ -661,8 +785,8 @@ example::
 Configuring the LDAP Identity Provider
 ===========================================================
 
-As an alternative to the SQL Databse backing store, Keystone can Use a
-Directory server to provide the Identity service.  An example Schema
+As an alternative to the SQL Database backing store, Keystone can use a
+directory server to provide the Identity service.  An example Schema
 for openstack would look like this::
 
   dn: cn=openstack,cn=org
@@ -693,3 +817,16 @@ The corresponding entries in the Keystone configuration file are::
   suffix = dc=openstack,dc=org
   user = dc=Manager,dc=openstack,dc=org
   password = badpassword
+
+The default object classes and attributes are intentionally simplistic.  They
+reflect the common standard objects according to the LDAP RFCs.  However,
+in a live deployment,  the correct attributes can be overridden to support a
+preexisting, more complex schema.  For example,  in the user object,  the
+objectClass posixAccount from RFC2307 is very common.  If this is the
+underlying objectclass, then the *uid* field should probably be *uidNumber* and
+*username* field either *uid* or *cn*.  To change these two fields,  the
+corresponding entries in the Keystone configuration file are::
+
+  [ldap]
+  user_id_attribute = uidNumber
+  user_name_attribute = cn

@@ -14,11 +14,15 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import time
 import uuid
+import webob
 
 import nose.exc
 
 from keystone import test
+from keystone.openstack.common import jsonutils
+
 
 import default_fixtures
 
@@ -132,8 +136,9 @@ class KeystoneClientTests(object):
         from keystoneclient import exceptions as client_exceptions
         client = self.get_client()
         token = client.auth_token
-        self.assertRaises(client_exceptions.AuthorizationFailure,
-                          self._client, token=token, tenant_id='baz')
+        self.assertRaises(client_exceptions.Unauthorized,
+                          self._client, token=token,
+                          tenant_id=uuid.uuid4().hex)
 
     def test_authenticate_token_tenant_name(self):
         client = self.get_client()
@@ -174,6 +179,53 @@ class KeystoneClientTests(object):
         self.assertRaises(client_exceptions.AuthorizationFailure,
                           self.get_client,
                           user_ref)
+
+    def test_authenticate_disabled_tenant(self):
+        from keystoneclient import exceptions as client_exceptions
+
+        admin_client = self.get_client(admin=True)
+
+        tenant = {
+            'name': uuid.uuid4().hex,
+            'description': uuid.uuid4().hex,
+            'enabled': False,
+        }
+        tenant_ref = admin_client.tenants.create(
+            tenant_name=tenant['name'],
+            description=tenant['description'],
+            enabled=tenant['enabled'])
+        tenant['id'] = tenant_ref.id
+
+        user = {
+            'name': uuid.uuid4().hex,
+            'password': uuid.uuid4().hex,
+            'email': uuid.uuid4().hex,
+            'tenant_id': tenant['id'],
+        }
+        user_ref = admin_client.users.create(
+            name=user['name'],
+            password=user['password'],
+            email=user['email'],
+            tenant_id=user['tenant_id'])
+        user['id'] = user_ref.id
+
+        # password authentication
+        self.assertRaises(
+            client_exceptions.Unauthorized,
+            self._client,
+            username=user['name'],
+            password=user['password'],
+            tenant_id=tenant['id'])
+
+        # token authentication
+        client = self._client(
+            username=user['name'],
+            password=user['password'])
+        self.assertRaises(
+            client_exceptions.Unauthorized,
+            self._client,
+            token=client.auth_token,
+            tenant_id=tenant['id'])
 
     # FIXME(ja): this test should require the "keystone:admin" roled
     #            (probably the role set via --keystone_admin_role flag)
@@ -233,7 +285,14 @@ class KeystoneClientTests(object):
         self.assertRaises(client_exceptions.NotFound, client.tenants.get,
                           tenant.id)
         self.assertFalse([t for t in client.tenants.list()
-                           if t.id == tenant.id])
+                         if t.id == tenant.id])
+
+    def test_tenant_create_no_name(self):
+        from keystoneclient import exceptions as client_exceptions
+        client = self.get_client(admin=True)
+        self.assertRaises(client_exceptions.BadRequest,
+                          client.tenants.create,
+                          tenant_name="")
 
     def test_tenant_delete_404(self):
         from keystoneclient import exceptions as client_exceptions
@@ -276,15 +335,66 @@ class KeystoneClientTests(object):
         self.assertRaises(client_exceptions.Unauthorized,
                           self._client,
                           username=self.user_foo['name'],
-                          password='invalid')
+                          password=uuid.uuid4().hex)
 
-    def test_invalid_user_password(self):
+    def test_invalid_user_and_password(self):
         from keystoneclient import exceptions as client_exceptions
 
         self.assertRaises(client_exceptions.Unauthorized,
                           self._client,
-                          username='blah',
-                          password='blah')
+                          username=uuid.uuid4().hex,
+                          password=uuid.uuid4().hex)
+
+    def test_change_password_invalidates_token(self):
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(admin=True)
+
+        username = uuid.uuid4().hex
+        passwd = uuid.uuid4().hex
+        user = client.users.create(name=username, password=passwd,
+                                   email=uuid.uuid4().hex)
+
+        token_id = client.tokens.authenticate(username=username,
+                                              password=passwd).id
+
+        # authenticate with a token should work before a password change
+        client.tokens.authenticate(token=token_id)
+
+        client.users.update_password(user=user.id, password=uuid.uuid4().hex)
+
+        # authenticate with a token should not work after a password change
+        self.assertRaises(client_exceptions.Unauthorized,
+                          client.tokens.authenticate,
+                          token=token_id)
+
+    def test_disable_user_invalidates_token(self):
+        from keystoneclient import exceptions as client_exceptions
+
+        admin_client = self.get_client(admin=True)
+        foo_client = self.get_client(self.user_foo)
+
+        admin_client.users.update_enabled(user=self.user_foo['id'],
+                                          enabled=False)
+
+        self.assertRaises(client_exceptions.Unauthorized,
+                          foo_client.tokens.authenticate,
+                          token=foo_client.auth_token)
+
+        self.assertRaises(client_exceptions.Unauthorized,
+                          self.get_client,
+                          self.user_foo)
+
+    def test_token_expiry_maintained(self):
+        foo_client = self.get_client(self.user_foo)
+        orig_token = foo_client.service_catalog.catalog['token']
+
+        time.sleep(1.01)
+        reauthenticated_token = foo_client.tokens.authenticate(
+            token=foo_client.auth_token)
+
+        self.assertEquals(orig_token['expires'],
+                          reauthenticated_token.expires)
 
     def test_user_create_update_delete(self):
         from keystoneclient import exceptions as client_exceptions
@@ -309,10 +419,10 @@ class KeystoneClientTests(object):
         user = client.users.get(user.id)
         self.assertFalse(user.enabled)
 
-        self.assertRaises(client_exceptions.AuthorizationFailure,
-                  self._client,
-                  username=test_username,
-                  password='password')
+        self.assertRaises(client_exceptions.Unauthorized,
+                          self._client,
+                          username=test_username,
+                          password='password')
         client.users.update_enabled(user, True)
 
         user = client.users.update_password(user=user, password='password2')
@@ -335,6 +445,15 @@ class KeystoneClientTests(object):
                                     email='user1@test.com',
                                     tenant_id='bar')
         self.assertEquals(user2.name, test_username)
+
+    def test_user_create_no_name(self):
+        from keystoneclient import exceptions as client_exceptions
+        client = self.get_client(admin=True)
+        self.assertRaises(client_exceptions.BadRequest,
+                          client.users.create,
+                          name="",
+                          password=uuid.uuid4().hex,
+                          email=uuid.uuid4().hex)
 
     def test_user_create_404(self):
         from keystoneclient import exceptions as client_exceptions
@@ -427,6 +546,13 @@ class KeystoneClientTests(object):
         self.assertRaises(client_exceptions.NotFound,
                           client.roles.get,
                           role=role.id)
+
+    def test_role_create_no_name(self):
+        from keystoneclient import exceptions as client_exceptions
+        client = self.get_client(admin=True)
+        self.assertRaises(client_exceptions.BadRequest,
+                          client.roles.create,
+                          name="")
 
     def test_role_get_404(self):
         from keystoneclient import exceptions as client_exceptions
@@ -599,17 +725,6 @@ class KeystoneClientTests(object):
                           client.services.get,
                           id=uuid.uuid4().hex)
 
-    def test_endpoint_create_404(self):
-        from keystoneclient import exceptions as client_exceptions
-        client = self.get_client(admin=True)
-        self.assertRaises(client_exceptions.NotFound,
-                          client.endpoints.create,
-                          region=uuid.uuid4().hex,
-                          service_id=uuid.uuid4().hex,
-                          publicurl=uuid.uuid4().hex,
-                          adminurl=uuid.uuid4().hex,
-                          internalurl=uuid.uuid4().hex)
-
     def test_endpoint_delete_404(self):
         # the catalog backend is expected to return Not Implemented
         from keystoneclient import exceptions as client_exceptions
@@ -674,20 +789,20 @@ class KeystoneClientTests(object):
 
 class KcMasterTestCase(CompatTestCase, KeystoneClientTests):
     def get_checkout(self):
-        return KEYSTONECLIENT_REPO, 'master'
+        return KEYSTONECLIENT_REPO, '0.2.0'
 
     def test_tenant_add_and_remove_user(self):
         client = self.get_client(admin=True)
         client.roles.add_user_role(tenant=self.tenant_baz['id'],
-                                   user=self.user_foo['id'],
+                                   user=self.user_two['id'],
                                    role=self.role_useless['id'])
         user_refs = client.tenants.list_users(tenant=self.tenant_baz['id'])
-        self.assert_(self.user_foo['id'] in [x.id for x in user_refs])
+        self.assert_(self.user_two['id'] in [x.id for x in user_refs])
         client.roles.remove_user_role(tenant=self.tenant_baz['id'],
-                                      user=self.user_foo['id'],
+                                      user=self.user_two['id'],
                                       role=self.role_useless['id'])
         user_refs = client.tenants.list_users(tenant=self.tenant_baz['id'])
-        self.assert_(self.user_foo['id'] not in [x.id for x in user_refs])
+        self.assert_(self.user_two['id'] not in [x.id for x in user_refs])
 
     def test_user_role_add_404(self):
         from keystoneclient import exceptions as client_exceptions
@@ -792,6 +907,92 @@ class KcMasterTestCase(CompatTestCase, KeystoneClientTests):
                                             tenant=self.tenant_bar['id'])
         self.assertTrue(len(roles) > 0)
 
+    def test_user_can_update_passwd(self):
+        client = self.get_client(self.user_two)
+
+        token_id = client.auth_token
+        new_password = uuid.uuid4().hex
+
+        # TODO(derekh) : Update to use keystoneclient when available
+        class FakeResponse(object):
+            def start_fake_response(self, status, headers):
+                self.response_status = int(status.split(' ', 1)[0])
+                self.response_headers = dict(headers)
+        responseobject = FakeResponse()
+
+        req = webob.Request.blank(
+            '/v2.0/OS-KSCRUD/users/%s' % self.user_two['id'],
+            headers={'X-Auth-Token': token_id})
+        req.method = 'PATCH'
+        req.body = '{"user":{"password":"%s","original_password":"%s"}}' % \
+            (new_password, self.user_two['password'])
+        self.public_server.application(req.environ,
+                                       responseobject.start_fake_response)
+
+        self.user_two['password'] = new_password
+        self.get_client(self.user_two)
+
+    def test_user_cant_update_other_users_passwd(self):
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(self.user_two)
+
+        token_id = client.auth_token
+        new_password = uuid.uuid4().hex
+
+        # TODO(derekh) : Update to use keystoneclient when available
+        class FakeResponse(object):
+            def start_fake_response(self, status, headers):
+                self.response_status = int(status.split(' ', 1)[0])
+                self.response_headers = dict(headers)
+        responseobject = FakeResponse()
+
+        req = webob.Request.blank(
+            '/v2.0/OS-KSCRUD/users/%s' % self.user_foo['id'],
+            headers={'X-Auth-Token': token_id})
+        req.method = 'PATCH'
+        req.body = '{"user":{"password":"%s","original_password":"%s"}}' % \
+            (new_password, self.user_two['password'])
+        self.public_server.application(req.environ,
+                                       responseobject.start_fake_response)
+        self.assertEquals(403, responseobject.response_status)
+
+        self.user_two['password'] = new_password
+        self.assertRaises(client_exceptions.Unauthorized,
+                          self.get_client, self.user_two)
+
+    def test_tokens_after_user_update_passwd(self):
+        from keystoneclient import exceptions as client_exceptions
+
+        client = self.get_client(self.user_two)
+
+        token_id = client.auth_token
+        new_password = uuid.uuid4().hex
+
+        # TODO(derekh) : Update to use keystoneclient when available
+        class FakeResponse(object):
+            def start_fake_response(self, status, headers):
+                self.response_status = int(status.split(' ', 1)[0])
+                self.response_headers = dict(headers)
+        responseobject = FakeResponse()
+
+        req = webob.Request.blank(
+            '/v2.0/OS-KSCRUD/users/%s' % self.user_two['id'],
+            headers={'X-Auth-Token': token_id})
+        req.method = 'PATCH'
+        req.body = '{"user":{"password":"%s","original_password":"%s"}}' % \
+            (new_password, self.user_two['password'])
+
+        rv = self.public_server.application(
+            req.environ,
+            responseobject.start_fake_response)
+        responce_json = jsonutils.loads(rv.next())
+        new_token_id = responce_json['access']['token']['id']
+
+        self.assertRaises(client_exceptions.Unauthorized, client.tenants.list)
+        client.auth_token = new_token_id
+        client.tenants.list()
+
 
 class KcEssex3TestCase(CompatTestCase, KeystoneClientTests):
     def get_checkout(self):
@@ -800,28 +1001,28 @@ class KcEssex3TestCase(CompatTestCase, KeystoneClientTests):
     def test_tenant_add_and_remove_user(self):
         client = self.get_client(admin=True)
         client.roles.add_user_to_tenant(tenant_id=self.tenant_baz['id'],
-                                        user_id=self.user_foo['id'],
+                                        user_id=self.user_two['id'],
                                         role_id=self.role_useless['id'])
         role_refs = client.roles.get_user_role_refs(
-                user_id=self.user_foo['id'])
+            user_id=self.user_two['id'])
         self.assert_(self.tenant_baz['id'] in [x.tenantId for x in role_refs])
 
         # get the "role_refs" so we get the proper id, this is how the clients
         # do it
         roleref_refs = client.roles.get_user_role_refs(
-                user_id=self.user_foo['id'])
+            user_id=self.user_two['id'])
         for roleref_ref in roleref_refs:
             if (roleref_ref.roleId == self.role_useless['id']
-                and roleref_ref.tenantId == self.tenant_baz['id']):
+                    and roleref_ref.tenantId == self.tenant_baz['id']):
                 # use python's scope fall through to leave roleref_ref set
                 break
 
         client.roles.remove_user_from_tenant(tenant_id=self.tenant_baz['id'],
-                                             user_id=self.user_foo['id'],
+                                             user_id=self.user_two['id'],
                                              role_id=roleref_ref.id)
 
         role_refs = client.roles.get_user_role_refs(
-                user_id=self.user_foo['id'])
+            user_id=self.user_two['id'])
         self.assert_(self.tenant_baz['id'] not in
                      [x.tenantId for x in role_refs])
 
@@ -857,10 +1058,10 @@ class KcEssex3TestCase(CompatTestCase, KeystoneClientTests):
         user = client.users.get(user.id)
         self.assertFalse(user.enabled)
 
-        self.assertRaises(client_exceptions.AuthorizationFailure,
-                  self._client,
-                  username=test_username,
-                  password='password')
+        self.assertRaises(client_exceptions.Unauthorized,
+                          self._client,
+                          username=test_username,
+                          password='password')
         client.users.update_enabled(user, True)
 
         user = client.users.update_password(user=user, password='password2')
@@ -885,3 +1086,8 @@ class KcEssex3TestCase(CompatTestCase, KeystoneClientTests):
 
     def test_endpoint_delete_404(self):
         raise nose.exc.SkipTest('N/A')
+
+
+class Kc11TestCase(CompatTestCase, KeystoneClientTests):
+    def get_checkout(self):
+        return KEYSTONECLIENT_REPO, '0.1.1'
