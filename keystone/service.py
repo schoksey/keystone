@@ -438,6 +438,7 @@ class TokenController(wsgi.Application):
             self.token_api.create_token(
                 context, token_id, dict(key=token_id,
                                         id=token_id,
+                                        expires=auth_token_data['expires'],
                                         user=user_ref,
                                         tenant=tenant_ref,
                                         metadata=metadata_ref))
@@ -463,7 +464,7 @@ class TokenController(wsgi.Application):
         # TODO(termie): this stuff should probably be moved to middleware
         self.assert_admin(context)
 
-        if len(token_id) > cms.UUID_TOKEN_LENGTH:
+        if cms.is_ans1_token(token_id):
             data = json.loads(cms.cms_verify(cms.token_to_cms(token_id),
                                              config.CONF.signing.certfile,
                                              config.CONF.signing.ca_certs))
@@ -623,7 +624,7 @@ class TokenController(wsgi.Application):
 
         """
         if not catalog_ref:
-            return {}
+            return []
 
         services = {}
         for region, region_ref in catalog_ref.iteritems():
