@@ -99,7 +99,6 @@ import json
 import logging
 import os
 import stat
-import subprocess
 import time
 import webob
 import webob.exc
@@ -157,6 +156,16 @@ opts = [
     cfg.IntOpt('token_cache_time', default=300),
 ]
 CONF.register_opts(opts, group='keystone_authtoken')
+
+
+def will_expire_soon(expiry):
+    """ Determines if expiration is about to occur.
+
+    :param expiry: a datetime of the expected expiration
+    :returns: boolean : true if expiration is within 30 seconds
+    """
+    soon = (timeutils.utcnow() + datetime.timedelta(seconds=30))
+    return expiry < soon
 
 
 class InvalidUserToken(Exception):
@@ -230,6 +239,7 @@ class AuthProtocol(object):
         # Credentials used to verify this component with the Auth service since
         # validating tokens is a privileged call
         self.admin_token = self._conf_get('admin_token')
+        self.admin_token_expiry = None
         self.admin_user = self._conf_get('admin_user')
         self.admin_password = self._conf_get('admin_password')
         self.admin_tenant_name = self._conf_get('admin_tenant_name')
@@ -345,12 +355,21 @@ class AuthProtocol(object):
     def get_admin_token(self):
         """Return admin token, possibly fetching a new one.
 
+        if self.admin_token_expiry is set from fetching an admin token, check
+        it for expiration, and request a new token is the existing token
+        is about to expire.
+
         :return admin token id
         :raise ServiceError when unable to retrieve token from keystone
 
         """
+        if self.admin_token_expiry:
+            if will_expire_soon(self.admin_token_expiry):
+                self.admin_token = None
+
         if not self.admin_token:
-            self.admin_token = self._request_admin_token()
+            (self.admin_token,
+             self.admin_token_expiry) = self._request_admin_token()
 
         return self.admin_token
 
@@ -363,26 +382,36 @@ class AuthProtocol(object):
                                           self.key_file,
                                           self.cert_file)
 
-    def _http_request(self, method, path):
+    def _http_request(self, method, path, **kwargs):
         """HTTP request helper used to make unspecified content type requests.
 
         :param method: http method
         :param path: relative request url
-        :return (http response object)
+        :return (http response object, response body)
         :raise ServerError when unable to communicate with keystone
 
         """
         conn = self._get_http_connection()
 
-        try:
-            conn.request(method, path)
-            response = conn.getresponse()
-            body = response.read()
-        except Exception, e:
-            LOG.error('HTTP connection exception: %s' % e)
-            raise ServiceError('Unable to communicate with keystone')
-        finally:
-            conn.close()
+        RETRIES = 3
+        retry = 0
+
+        while True:
+            try:
+                conn.request(method, path, **kwargs)
+                response = conn.getresponse()
+                body = response.read()
+                break
+            except Exception as e:
+                if retry == RETRIES:
+                    LOG.error('HTTP connection exception: %s' % e)
+                    raise ServiceError('Unable to communicate with keystone')
+                # NOTE(vish): sleep 0.5, 1, 2
+                LOG.warn('Retrying on HTTP connection exception: %s' % e)
+                time.sleep(2.0 ** retry / 2)
+                retry += 1
+            finally:
+                conn.close()
 
         return response, body
 
@@ -398,8 +427,6 @@ class AuthProtocol(object):
         :raise ServerError when unable to communicate with keystone
 
         """
-        conn = self._get_http_connection()
-
         kwargs = {
             'headers': {
                 'Content-type': 'application/json',
@@ -413,16 +440,9 @@ class AuthProtocol(object):
         if body:
             kwargs['body'] = jsonutils.dumps(body)
 
-        full_path = self.auth_admin_prefix + path
-        try:
-            conn.request(method, full_path, **kwargs)
-            response = conn.getresponse()
-            body = response.read()
-        except Exception, e:
-            LOG.error('HTTP connection exception: %s' % e)
-            raise ServiceError('Unable to communicate with keystone')
-        finally:
-            conn.close()
+        path = self.auth_admin_prefix + path
+
+        response, body = self._http_request(method, path, **kwargs)
 
         try:
             data = jsonutils.loads(body)
@@ -455,10 +475,16 @@ class AuthProtocol(object):
 
         try:
             token = data['access']['token']['id']
+            expiry = data['access']['token']['expires']
             assert token
-            return token
+            assert expiry
+            datetime_expiry = timeutils.parse_isotime(expiry)
+            return (token, timeutils.normalize_time(datetime_expiry))
         except (AssertionError, KeyError):
             LOG.warn("Unexpected response from keystone service: %s", data)
+            raise ServiceError('invalid json response')
+        except (ValueError):
+            LOG.warn("Unable to parse expiration time from token: %s", data)
             raise ServiceError('invalid json response')
 
     def _validate_user_token(self, user_token, retry=True):
@@ -472,7 +498,8 @@ class AuthProtocol(object):
 
         """
         try:
-            cached = self._cache_get(user_token)
+            token_id = cms.cms_hash_token(user_token)
+            cached = self._cache_get(token_id)
             if cached:
                 return cached
             if cms.is_ans1_token(user_token):
@@ -480,7 +507,7 @@ class AuthProtocol(object):
                 data = json.loads(verified)
             else:
                 data = self.verify_uuid_token(user_token, retry)
-            self._cache_put(user_token, data)
+            self._cache_put(token_id, data)
             return data
         except Exception as e:
             LOG.debug('Token validation failure.', exc_info=True)
@@ -709,7 +736,7 @@ class AuthProtocol(object):
             try:
                 output = cms.cms_verify(data, self.signing_cert_file_name,
                                         self.ca_file_name)
-            except subprocess.CalledProcessError as err:
+            except cms.subprocess.CalledProcessError as err:
                 if self.cert_file_missing(err, self.signing_cert_file_name):
                     self.fetch_signing_cert()
                     continue
@@ -771,10 +798,16 @@ class AuthProtocol(object):
         with open(self.revoked_file_name, 'w') as f:
             f.write(value)
 
-    def fetch_revocation_list(self):
+    def fetch_revocation_list(self, retry=True):
         headers = {'X-Auth-Token': self.get_admin_token()}
         response, data = self._json_request('GET', '/v2.0/tokens/revoked',
                                             additional_headers=headers)
+        if response.status == 401:
+            if retry:
+                LOG.info('Keystone rejected admin token %s, resetting admin '
+                         'token', headers)
+                self.admin_token = None
+                return self.fetch_revocation_list(retry=False)
         if response.status != 200:
             raise ServiceError('Unable to fetch token revocation list.')
         if (not 'signed' in data):

@@ -22,6 +22,7 @@ from keystone import config
 from keystone import catalog
 from keystone.common import cms
 from keystone.common import logging
+from keystone.common import utils
 from keystone.common import wsgi
 from keystone import exception
 from keystone import identity
@@ -31,6 +32,8 @@ from keystone import token
 
 
 LOG = logging.getLogger(__name__)
+MAX_PARAM_SIZE = config.CONF.max_param_size
+MAX_TOKEN_SIZE = config.CONF.max_token_size
 
 
 class AdminRouter(wsgi.ComposingRouter):
@@ -288,9 +291,23 @@ class TokenController(wsgi.Application):
 
         if 'passwordCredentials' in auth:
             user_id = auth['passwordCredentials'].get('userId', None)
+            if user_id and len(user_id) > MAX_PARAM_SIZE:
+                raise exception.ValidationSizeError(attribute='userId',
+                                                    size=MAX_PARAM_SIZE)
             username = auth['passwordCredentials'].get('username', '')
+            if len(username) > MAX_PARAM_SIZE:
+                raise exception.ValidationSizeError(attribute='username',
+                                                    size=MAX_PARAM_SIZE)
             password = auth['passwordCredentials'].get('password', '')
+            max_pw_size = utils.MAX_PASSWORD_LENGTH
+            if len(password) > max_pw_size:
+                raise exception.ValidationSizeError(attribute='password',
+                                                    size=max_pw_size)
+
             tenant_name = auth.get('tenantName', None)
+            if tenant_name and len(tenant_name) > MAX_PARAM_SIZE:
+                raise exception.ValidationSizeError(attribute='tenantName',
+                                                    size=MAX_PARAM_SIZE)
 
             if username:
                 try:
@@ -302,6 +319,9 @@ class TokenController(wsgi.Application):
 
             # more compat
             tenant_id = auth.get('tenantId', None)
+            if tenant_id and len(tenant_id) > MAX_PARAM_SIZE:
+                raise exception.ValidationSizeError(attribute='tenantId',
+                                                    size=MAX_PARAM_SIZE)
             if tenant_name:
                 try:
                     tenant_ref = self.identity_api.get_tenant_by_name(
@@ -342,7 +362,14 @@ class TokenController(wsgi.Application):
                 catalog_ref = {}
         elif 'token' in auth:
             old_token = auth['token'].get('id', None)
+
+            if len(old_token) > MAX_TOKEN_SIZE:
+                raise exception.ValidationSizeError(attribute='token',
+                                                    size=MAX_TOKEN_SIZE)
             tenant_name = auth.get('tenantName')
+            if tenant_name and len(tenant_name) > MAX_PARAM_SIZE:
+                raise exception.ValidationSizeError(attribute='tenantName',
+                                                    size=MAX_PARAM_SIZE)
 
             try:
                 old_token_ref = self.token_api.get_token(context=context,
@@ -463,20 +490,13 @@ class TokenController(wsgi.Application):
         """
         # TODO(termie): this stuff should probably be moved to middleware
         self.assert_admin(context)
+        data = self.token_api.get_token(context=context, token_id=token_id)
+        if belongs_to:
+            if (not data.get('tenant') or data['tenant'].get('id') !=
+                    belongs_to):
+                raise exception.Unauthorized()
 
-        if cms.is_ans1_token(token_id):
-            data = json.loads(cms.cms_verify(cms.token_to_cms(token_id),
-                                             config.CONF.signing.certfile,
-                                             config.CONF.signing.ca_certs))
-            data['access']['token']['user'] = data['access']['user']
-            data['access']['token']['metadata'] = data['access']['metadata']
-            if belongs_to:
-                assert data['access']['token']['tenant']['id'] == belongs_to
-            token_ref = data['access']['token']
-        else:
-            token_ref = self.token_api.get_token(context=context,
-                                                 token_id=token_id)
-        return token_ref
+        return data
 
     # admin only
     def validate_token_head(self, context, token_id):
