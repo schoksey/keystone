@@ -17,10 +17,13 @@ import copy
 import uuid
 
 import ldap
+import mock
+from testtools import matchers
 
 from keystone import assignment
 from keystone.common import cache
 from keystone.common import ldap as common_ldap
+from keystone.common.ldap import core as common_ldap_core
 from keystone.common import sql
 from keystone import config
 from keystone import exception
@@ -544,6 +547,34 @@ class BaseLDAPIdentity(test_backend.IdentityTests):
     def test_updated_arbitrary_attributes_are_returned_from_update_user(self):
         self.skipTest("Using arbitrary attributes doesn't work under LDAP")
 
+    def test_user_id_comma_grants(self):
+        """Even if the user has a , in their ID, can get user and group grants.
+        """
+
+        # Create a user with a , in their ID
+        # NOTE(blk-u): the DN for this user is hard-coded in fakeldap!
+        user_id = u'Doe, John'
+        user = {
+            'id': user_id,
+            'name': self.getUniqueString(),
+            'password': self.getUniqueString(),
+            'domain_id': CONF.identity.default_domain_id,
+        }
+        self.identity_api.create_user(user_id, user)
+
+        # Grant the user a role on a project.
+
+        role_id = 'member'
+        project_id = self.tenant_baz['id']
+
+        self.assignment_api.create_grant(role_id, user_id=user_id,
+                                         project_id=project_id)
+
+        role_ref = self.assignment_api.get_grant(role_id, user_id=user_id,
+                                                 project_id=project_id)
+
+        self.assertEqual(role_id, role_ref['id'])
+
 
 class LDAPIdentity(BaseLDAPIdentity, tests.TestCase):
     def setUp(self):
@@ -984,12 +1015,53 @@ class LDAPIdentity(BaseLDAPIdentity, tests.TestCase):
         dn, attrs = self.identity_api.driver.user._ldap_get(user['id'])
         self.assertTrue(user['name'] in attrs['description'])
 
+    def test_user_extra_attribute_mapping_description_is_returned(self):
+        # Given a mapping like description:description, the description is
+        # returned.
+
+        self.config_fixture.config(
+            group='ldap',
+            user_additional_attribute_mapping=['description:description'])
+        self.load_backends()
+
+        description = uuid.uuid4().hex
+        user = {
+            'id': uuid.uuid4().hex,
+            'name': uuid.uuid4().hex,
+            'description': description,
+            'password': uuid.uuid4().hex,
+            'domain_id': CONF.identity.default_domain_id
+        }
+        self.identity_api.create_user(user['id'], user)
+        res = self.identity_api.driver.user.get_all()
+
+        new_user = [u for u in res if u['id'] == user['id']][0]
+        self.assertThat(new_user['description'], matchers.Equals(description))
+
+    @mock.patch.object(common_ldap_core.BaseLdap, '_ldap_get')
+    def test_user_mixed_case_attribute(self, mock_ldap_get):
+        # Mock the search results to return attribute names
+        # with unexpected case.
+        mock_ldap_get.return_value = (
+            'cn=junk,dc=example,dc=com',
+            {
+                'sN': [uuid.uuid4().hex],
+                'eMaIl': [uuid.uuid4().hex]
+            }
+        )
+        user = self.identity_api.get_user('junk')
+        self.assertEqual(mock_ldap_get.return_value[1]['sN'][0],
+                         user['name'])
+        self.assertEqual(mock_ldap_get.return_value[1]['eMaIl'][0],
+                         user['email'])
+
     def test_parse_extra_attribute_mapping(self):
         option_list = ['description:name', 'gecos:password',
                        'fake:invalid', 'invalid1', 'invalid2:',
                        'description:name:something']
         mapping = self.identity_api.driver.user._parse_extra_attrs(option_list)
-        expected_dict = {'description': 'name', 'gecos': 'password'}
+        expected_dict = {'description': 'name', 'gecos': 'password',
+                         'fake': 'invalid', 'invalid2': ''}
         self.assertDictEqual(expected_dict, mapping)
 
 # TODO(henry-nash): These need to be removed when the full LDAP implementation
