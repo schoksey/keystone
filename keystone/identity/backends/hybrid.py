@@ -14,7 +14,7 @@ CONF = ks_cfg.CONF
 # create and register custom opts
 ks_cfg.CONF.register_opt(cfg.StrOpt('user_suffix'), group='ldap')
 ks_cfg.CONF.register_opt(cfg.StrOpt('generic_tree_dn'), group='ldap')
-ks_cfg.CONF.register_opt(cfg.StrOpt('builtin_users'), group='ldap')
+ks_cfg.CONF.register_opt(cfg.ListOpt('builtin_users'), group='ldap')
 
 DEFAULT_DOMAIN_ID = CONF.identity.default_domain_id
 LDAP_BIND_USER = CONF.ldap.user

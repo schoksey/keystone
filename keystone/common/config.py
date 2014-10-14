@@ -238,12 +238,7 @@ FILE_OPTIONS = {
         cfg.StrOpt('tls_cacertfile', default=None),
         cfg.StrOpt('tls_cacertdir', default=None),
         cfg.BoolOpt('use_tls', default=False),
-        cfg.StrOpt('tls_req_cert', default='demand'),
-
-        # (schoksey): start - New attributes added for Generic DN,user attribute suffix,built-in users list
-        cfg.StrOpt('user_suffix', default=None),
-        cfg.StrOpt('generic_tree_dn', default=None),
-        cfg.StrOpt('builtin_users', default=[])],
+        cfg.StrOpt('tls_req_cert', default='demand')],
 
     'pam': [
         cfg.StrOpt('userid', default=None),
